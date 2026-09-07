@@ -19,6 +19,8 @@ use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use Illuminate\View\View;
@@ -61,7 +63,109 @@ class AiVisibilityAnalyticsController extends Controller
             'topCitedUrls' => Schema::hasTable('ai_visibility_sources')
                 ? $this->topCitedUrls(30, 10)
                 : collect(),
+            'aiVisibilitySchedule' => Schema::hasTable('ai_visibility_schedules')
+                ? DB::table('ai_visibility_schedules')->orderBy('id')->first()
+                : null,
+            'recentTraces' => Schema::hasTable('ai_visibility_runs')
+                ? $this->recentCallTraces(10)
+                : collect(),
         ]);
+    }
+
+    /**
+     * 最近完成的调用记录及其调用链路细节(接口端点/模型/request id/时间/请求与响应摘要),
+     * 供核对"实际调用了哪个接口、模型、何时调用"。
+     *
+     * @return Collection<int, array<string, mixed>>
+     */
+    private function recentCallTraces(int $limit): Collection
+    {
+        // 从用量账本取 OpenAI 兼容调用的 request id(deepseek 分析等)
+        $attemptRequestIds = [];
+        try {
+            $attemptRequestIds = DB::table('ai_model_usage_attempt_starts')
+                ->where('business_source', 'ai_visibility_collection')
+                ->pluck('request_id', 'source_id')
+                ->all();
+        } catch (Throwable $e) {
+            // 账本表缺失时忽略,不影响展示
+        }
+
+        return AiVisibilityRun::query()
+            ->where('status', 'completed')
+            ->latest('id')
+            ->limit($limit)
+            ->get()
+            ->map(function (AiVisibilityRun $run) use ($attemptRequestIds): array {
+                $rawRequest = is_array($run->raw_request_json) ? $run->raw_request_json : [];
+                $rawResponse = is_array($run->raw_response_json) ? $run->raw_response_json : [];
+                $analysis = is_array($run->analysis_json) ? $run->analysis_json : [];
+                $usage = is_array($run->usage_json) ? $run->usage_json : [];
+
+                $isSearch = $run->provider_key === 'doubao_search_custom';
+
+                // 端点与模型
+                if ($isSearch) {
+                    $endpoint = (string) ($rawRequest['endpoint'] ?? '');
+                    $model = '-';
+                } else {
+                    $endpoint = (string) ($rawRequest['provider_url'] ?? '');
+                    $model = (string) ($run->model_id ?: '');
+                }
+
+                // request id: 豆包搜索取火山 log_id / ResponseMetadata.RequestId;模型调用取用量账本 request_id
+                $requestId = (string) ($analysis['log_id'] ?? '')
+                    ?: (string) (($rawResponse['ResponseMetadata']['RequestId'] ?? '') ?: '')
+                    ?: (string) ($attemptRequestIds[(int) $run->id] ?? '');
+
+                // 请求体摘要
+                $promptExcerpt = '';
+                if ($isSearch) {
+                    $query = $rawRequest['payload']['Query'] ?? null;
+                    $promptExcerpt = is_string($query) ? mb_substr($query, 0, 120) : '';
+                } else {
+                    $prompt = $rawRequest['prompt'] ?? '';
+                    $promptExcerpt = is_string($prompt) ? mb_substr(preg_replace('/\s+/u', ' ', $prompt) ?: '', 0, 160) : '';
+                }
+
+                // 响应摘要
+                $responseExcerpt = '';
+                if ($isSearch) {
+                    $responseExcerpt = sprintf('%d 条搜索结果', (int) ($analysis['result_count'] ?? 0));
+                } else {
+                    $text = $rawResponse['text'] ?? '';
+                    $responseExcerpt = is_string($text)
+                        ? mb_substr(preg_replace('/\s+/u', ' ', $text) ?: '', 0, 160)
+                        : '';
+                }
+
+                $tokens = '';
+                if (isset($usage['prompt_tokens']) || isset($usage['completion_tokens'])) {
+                    $tokens = sprintf('in %s / out %s',
+                        (string) ($usage['prompt_tokens'] ?? '0'),
+                        (string) ($usage['completion_tokens'] ?? '0'),
+                    );
+                }
+
+                return [
+                    'id' => (int) $run->id,
+                    'keyword' => (string) $run->keyword,
+                    'provider_key' => (string) $run->provider_key,
+                    'stage_label' => $isSearch ? __('admin.analytics.ai_visibility.traces.stage_search') : __('admin.analytics.ai_visibility.traces.stage_analysis'),
+                    'endpoint' => $endpoint,
+                    'model' => $model,
+                    'request_id' => $requestId,
+                    'started_at' => (string) ($run->started_at ?? ''),
+                    'completed_at' => (string) ($run->completed_at ?? ''),
+                    'latency_ms' => (int) $run->latency_ms,
+                    'tokens' => $tokens,
+                    'status' => (string) $run->status,
+                    'prompt_excerpt' => $promptExcerpt,
+                    'response_excerpt' => $responseExcerpt,
+                    'usage' => $usage,
+                ];
+            })
+            ->values();
     }
 
     /**
@@ -140,6 +244,47 @@ class AiVisibilityAnalyticsController extends Controller
         }
 
         return back()->with('message', __('admin.analytics.ai_visibility.competitors.detect_queued'));
+    }
+
+    /**
+     * 保存自动采集配置(启用开关、每天采集次数、采集关键词范围)。
+     */
+    public function saveSchedule(Request $request): RedirectResponse
+    {
+        $data = $request->validate([
+            'enabled' => ['nullable'],
+            'frequency' => ['required', 'integer', 'in:1,2,3,4'],
+            'keyword_ids' => ['nullable', 'array'],
+            'keyword_ids.*' => ['integer'],
+        ]);
+
+        $timesByFrequency = [
+            1 => ['08:00'],
+            2 => ['08:00', '20:00'],
+            3 => ['08:00', '14:00', '20:00'],
+            4 => ['02:00', '08:00', '14:00', '20:00'],
+        ];
+
+        $keywordIds = collect(Arr::wrap($data['keyword_ids'] ?? []))
+            ->map(static fn ($id): int => (int) $id)
+            ->filter(static fn (int $id): bool => $id > 0)
+            ->unique()
+            ->values()
+            ->all();
+
+        $enabled = array_key_exists('enabled', $data);
+
+        DB::table('ai_visibility_schedules')->updateOrInsert(
+            ['id' => 1],
+            [
+                'enabled' => $enabled,
+                'times_json' => json_encode($timesByFrequency[(int) $data['frequency']]),
+                'keyword_ids_json' => $keywordIds === [] ? null : json_encode($keywordIds),
+                'updated_at' => now(),
+            ],
+        );
+
+        return back()->with('message', __('admin.analytics.ai_visibility.schedule.saved'));
     }
 
     /**

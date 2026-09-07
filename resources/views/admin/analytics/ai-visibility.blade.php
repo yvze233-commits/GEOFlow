@@ -211,6 +211,10 @@
                 </section>
 
                 @if (auth('admin')->user()?->isSuperAdmin())
+                    @include('admin.analytics._ai-visibility-schedule')
+
+                    @include('admin.analytics._ai-visibility-traces')
+
                     @include('admin.analytics._ai-visibility-collect')
                 @endif
             </section>
