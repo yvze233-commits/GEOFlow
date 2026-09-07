@@ -173,6 +173,9 @@ Route::prefix($adminPrefix)->name('admin.')->middleware(['admin.locale'])->group
             Route::post('ai-visibility/competitors/detect', [AiVisibilityAnalyticsController::class, 'detectCompetitors'])
                 ->middleware(['admin.super', 'throttle:admin-sensitive'])
                 ->name('ai-visibility.competitors.detect');
+            Route::post('ai-visibility/schedule', [AiVisibilityAnalyticsController::class, 'saveSchedule'])
+                ->middleware(['admin.super', 'throttle:admin-sensitive'])
+                ->name('ai-visibility.schedule');
             Route::delete('ai-visibility/competitors/{competitor}/delete', [AiVisibilityAnalyticsController::class, 'destroyCompetitor'])
                 ->whereNumber('competitor')
                 ->middleware(['admin.super', 'throttle:admin-sensitive'])
